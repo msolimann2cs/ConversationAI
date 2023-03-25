@@ -1,0 +1,199 @@
+import os
+import re
+import torch
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+
+# Define the path to the Cornell Movie-Dialogs Corpus dataset
+data_dir = "archive"
+
+# Define a function to preprocess the data
+def preprocess_data(data_dir):
+    # Load the lines and conversations data
+    lines_file = os.path.join(data_dir, "movie_lines.txt")
+    conv_file = os.path.join(data_dir, "movie_conversations.txt")
+    lines = open(lines_file, encoding="utf-8", errors="ignore").read().split("\n")
+    convs = open(conv_file, encoding="utf-8", errors="ignore").read().split("\n")
+
+    # Create a dictionary to map line IDs to the corresponding text
+    id2line = {}
+    for line in lines:
+        parts = line.split(" +++$+++ ")
+        if len(parts) == 5:
+            id2line[parts[0]] = parts[4]
+
+    # Create a list of conversation IDs and their corresponding lines
+    conversations = []
+    for conv in convs:
+        parts = conv.split(" +++$+++ ")
+        if len(parts) == 4:
+            line_ids = re.findall(r"'(.*?)'", parts[3])
+            lines = [id2line[id] for id in line_ids]
+            conversations.append(lines)
+
+    # Create a list of input-output pairs for training the model
+    pairs = []
+    for conv in conversations:
+        for i in range(len(conv)-1):
+            input_line = conv[i].strip()
+            output_line = conv[i+1].strip()
+            if input_line and output_line:
+                pairs.append((input_line, output_line))
+
+    return pairs
+
+# Define a function to tokenize the data
+def tokenize_data(pairs):
+    # Create a list of all the input and output lines
+    lines = [pair[0] for pair in pairs] + [pair[1] for pair in pairs]
+
+    # Tokenize the lines using a simple whitespace tokenizer
+    tokens = [line.lower().split(" ") for line in lines]
+
+
+    # Create a dictionary to map tokens to indices
+    # token2idx = {"<PAD>": 0, "<UNK>": 1, "<SOS>": 2, "<EOS>": 3}
+    # for token in set([token for line in tokens for token in line]):
+    #     token2idx[token] = len(token2idx)
+
+    token2idx = {"<PAD>": 0, "<UNK>": 1, "<SOS>": 2, "<EOS>": 3}
+    for token in set([token for line in tokens for token in line]):
+        if token not in token2idx:
+            token2idx[token] = len(token2idx)
+
+
+    # Convert the tokens to indices and pad the sequences
+    input_seqs = [[token2idx.get(token, token2idx['<UNK>']) for token in line] for line, _ in pairs]
+    output_seqs = [[token2idx.get(token, token2idx["<UNK>"]) for token in line] for _, line in pairs]
+    input_seqs_padded = torch.nn.utils.rnn.pad_sequence([torch.tensor(seq) for seq in input_seqs], padding_value=token2idx["<PAD>"], batch_first=True)
+    output_seqs_padded = torch.nn.utils.rnn.pad_sequence([torch.tensor(seq) for seq in output_seqs], padding_value=token2idx["<PAD>"], batch_first=True)
+
+    return input_seqs_padded, output_seqs_padded, token2idx
+
+# Define a PyTorch dataset for the input-output pairs
+class MovieDialogDataset(Dataset):
+    def __init__(self, input_seqs, output_seqs):
+
+        super(MovieDialogDataset, self).__init__()
+        self.input_seqs = input_seqs
+        self.output_seqs = output_seqs
+
+    def __len__(self):
+        return len(self.input_seqs)
+
+    def __getitem__(self, index):
+        input_seq = self.input_seqs[index]
+        output_seq = self.output_seqs[index]
+        return input_seq, output_seq
+
+# Define a function to create data loaders for the training and validation data
+def create_data_loaders(input_seqs, output_seqs, batch_size=32, shuffle=True, num_workers=0):
+    dataset = MovieDialogDataset(input_seqs, output_seqs)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
+    return dataloader
+
+# Define the Seq2Seq model
+class Seq2Seq(torch.nn.Module):
+    def __init__(self, input_vocab_size, output_vocab_size, hidden_size, num_layers=1, dropout=0.1):
+        super(Seq2Seq, self).__init__()
+        self.encoder = torch.nn.Embedding(input_vocab_size, hidden_size)
+        self.encoder_dropout = torch.nn.Dropout(dropout)
+        self.encoder_rnn = torch.nn.GRU(hidden_size, hidden_size, num_layers=num_layers, batch_first=True)
+        self.decoder = torch.nn.Embedding(output_vocab_size, hidden_size)
+        self.decoder_dropout = torch.nn.Dropout(dropout)
+        self.decoder_rnn = torch.nn.GRU(hidden_size, hidden_size, num_layers=num_layers, batch_first=True)
+        self.output_layer = torch.nn.Linear(hidden_size, output_vocab_size)
+
+    def forward(self, input_seq, output_seq):
+        # Encoder
+        input_emb = self.encoder_dropout(self.encoder(input_seq))
+        _, hidden = self.encoder_rnn(input_emb)
+
+        # Decoder
+        output_emb = self.decoder_dropout(self.decoder(output_seq))
+        output, _ = self.decoder_rnn(output_emb, hidden)
+        output = self.output_layer(output)
+
+        return output
+
+# Define the training loop
+def train(model, dataloader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    for input_seq, output_seq in dataloader:
+        input_seq = input_seq.to(device)
+        output_seq = output_seq.to(device)
+        target_seq = output_seq[:, 1:]
+        output_seq = output_seq[:, :-1]
+        output = model(input_seq, output_seq)
+        output = output.reshape(-1, output.shape[-1])
+        target_seq = target_seq.reshape(-1)
+        loss = criterion(output, target_seq)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+# Define the validation loop
+def validate(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for input_seq, output_seq in dataloader:
+            input_seq = input_seq.to(device)
+            output_seq = output_seq.to(device)
+            target_seq = output_seq[:, 1:]
+            output_seq = output_seq[:, :-1]
+            output = model(input_seq, output_seq)
+            output = output.reshape(-1, output.shape[-1])
+            target_seq = target_seq.reshape(-1)
+            loss = criterion(output, target_seq)
+            total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+# Set up the training and validation data loaders
+pairs = preprocess_data(data_dir)
+input_seqs_padded, output_seqs_padded, token2idx = tokenize_data(pairs)
+train_loader = create_data_loaders(input_seqs_padded[:-1000], output_seqs_padded[:-1000], batch_size=32)
+val_loader = create_data_loaders(input_seqs_padded[-1000:], output_seqs_padded[-1000:], batch_size=32)
+
+# Set up the model and optimizer
+# input_vocab_size = len(token2idx['input'])
+# output_vocab_size = len(token2idx['output'])
+input_vocab_size = output_vocab_size = len(token2idx)
+hidden_size = 256
+model = Seq2Seq(input_vocab_size, output_vocab_size, hidden_size, num_layers=2, dropout=0.2)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+criterion = torch.nn.CrossEntropyLoss(ignore_index=0)
+
+# Train the model
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+num_epochs = 10
+for epoch in range(num_epochs):
+    train_loss = train(model, train_loader, optimizer, criterion, device)
+    val_loss = validate(model, val_loader, criterion, device)
+    print(f'Epoch {epoch + 1}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}')
+
+# Define a function to generate a response from the model
+def generate_response(model, input_sentence, token2idx, max_length=50):
+    input_seq = torch.LongTensor(tokenize_input(input_sentence, token2idx)).unsqueeze(0)
+    model.eval()
+    with torch.no_grad():
+        input_seq = input_seq.to(device)
+        output_seq = torch.LongTensor([token2idx['output']['<sos>']]).unsqueeze(0).to(device)
+        for i in range(max_length):
+            output = model(input_seq, output_seq)
+            output_token = torch.argmax(output[:, -1, :], dim=-1).item()
+            if output_token == token2idx['output']['<eos>']:
+                break
+            output_seq = torch.cat([output_seq, torch.LongTensor([output_token]).unsqueeze(0).to(device)], dim=-1)
+    response = ' '.join([token2idx['output_inv'][token.item()] for token in output_seq[0]])
+    return response
+
+# Test the model by generating a response to a sample input sentence
+input_sentence = "Hi, how are you?"
+response = generate_response(model, input_sentence, token2idx)
+print(f'Input sentence: {input_sentence}')
+print(f'Response: {response}')
